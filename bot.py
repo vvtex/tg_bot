@@ -16,23 +16,22 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, CallbackQuery, KeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
-# ========== Конфигурация из переменных окружения ==========
+# ========== Конфигурация ==========
 API_TOKEN = os.getenv("API_TOKEN")
 if not API_TOKEN:
     raise ValueError("❌ Переменная окружения API_TOKEN не задана!")
 
-EMAIL = os.getenv("EMAIL")          # может быть пустым
-TG_ADMIN = os.getenv("TG_ADMIN")    # может быть пустым (числовой ID)
+EMAIL = os.getenv("EMAIL")
+TG_ADMIN = os.getenv("TG_ADMIN")
 if TG_ADMIN:
     try:
         TG_ADMIN = int(TG_ADMIN)
     except ValueError:
-        logging.warning("TG_ADMIN должен быть числом. Уведомления в Telegram отключены.")
+        logging.warning("TG_ADMIN должен быть числом (ID). Уведомления в Telegram отключены.")
         TG_ADMIN = None
 
 DATABASE = "barbershop.sqlt"
 
-# Настройки SMTP (если нужно, задайте переменные)
 SMTP_SERVER = os.getenv("SMTP_SERVER", "localhost")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 25))
 SMTP_LOGIN = os.getenv("SMTP_LOGIN")
@@ -40,7 +39,6 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
 logging.basicConfig(level=logging.INFO)
 
-# Блокировка для доступа к SQLite
 db_lock = Lock()
 
 # ========== Вспомогательная функция для выполнения запросов в потоке ==========
@@ -52,7 +50,6 @@ async def run_db_query(func, *args, **kwargs):
 def init_db_sync():
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
-    # Пользователи
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -63,7 +60,6 @@ def init_db_sync():
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Услуги
     cur.execute('''
         CREATE TABLE IF NOT EXISTS services (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,7 +68,6 @@ def init_db_sync():
             price INTEGER
         )
     ''')
-    # Записи
     cur.execute('''
         CREATE TABLE IF NOT EXISTS appointments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,7 +82,6 @@ def init_db_sync():
             FOREIGN KEY(service_id) REFERENCES services(id)
         )
     ''')
-    # Слоты
     cur.execute('''
         CREATE TABLE IF NOT EXISTS slots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,7 +90,6 @@ def init_db_sync():
             is_available INTEGER DEFAULT 1
         )
     ''')
-    # Добавим услуги по умолчанию
     cur.execute("SELECT COUNT(*) FROM services")
     if cur.fetchone()[0] == 0:
         services = [
@@ -488,7 +481,7 @@ class AppointmentFSM(StatesGroup):
 class CancelFSM(StatesGroup):
     waiting_confirm = State()
 
-# ========== Клавиатуры ==========
+# ========== Клавиатуры (только синхронные вызовы) ==========
 def main_menu_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.add(KeyboardButton(text="📅 Записаться"))
@@ -505,7 +498,7 @@ def cancel_keyboard():
     return builder.as_markup(resize_keyboard=True)
 
 def services_inline_keyboard():
-    services = get_services_sync()  # синхронно, т.к. вызывается до запуска поллинга
+    services = get_services_sync()  # синхронный вызов
     builder = InlineKeyboardBuilder()
     for s in services:
         builder.button(text=f"{s[1]} - {s[3]} руб.", callback_data=f"service_{s[0]}")
@@ -524,7 +517,7 @@ def dates_inline_keyboard():
     return builder.as_markup()
 
 def times_inline_keyboard(date_str):
-    slots = get_available_slots_for_date_sync(date_str)
+    slots = get_available_slots_for_date_sync(date_str)  # синхронный вызов
     builder = InlineKeyboardBuilder()
     for t in slots:
         builder.button(text=t, callback_data=f"time_{t}")
@@ -603,8 +596,7 @@ async def date_chosen(callback: CallbackQuery, state: FSMContext):
         return
     await callback.message.edit_text(f"Выбрана дата {date_str}. Теперь выберите время:")
     await state.set_state(AppointmentFSM.choosing_time)
-    # Показываем клавиатуру с доступным временем
-    kb = times_inline_keyboard(date_str)  # используем синхронную версию, т.к. слоты уже получили
+    kb = times_inline_keyboard(date_str)
     await callback.message.answer("Выберите время:", reply_markup=kb)
     await callback.answer()
 
