@@ -13,7 +13,7 @@ from aiogram.types import Message, CallbackQuery, KeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
 # ========== Конфигурация ==========
-API_TOKEN = os.getenv("API_TOKEN", "YOUR_BOT_TOKEN")  # токен бота (можно вписать напрямую)
+API_TOKEN = os.getenv("API_TOKEN", "YOUR_BOT_TOKEN")
 DATABASE = "barbershop.sqlt"
 
 logging.basicConfig(level=logging.INFO)
@@ -22,13 +22,14 @@ logging.basicConfig(level=logging.INFO)
 def init_db():
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
-    # Пользователи (роль больше не нужна, но оставим для совместимости)
+    # Пользователи (добавлено поле notifications)
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             full_name TEXT,
             phone TEXT,
+            notifications INTEGER DEFAULT 1,
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -41,7 +42,7 @@ def init_db():
             price INTEGER
         )
     ''')
-    # Записи (статус теперь только для пользователя: pending, confirmed, cancelled, done)
+    # Записи
     cur.execute('''
         CREATE TABLE IF NOT EXISTS appointments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,6 +88,21 @@ def register_user(user_id, username, full_name):
                 (user_id, username, full_name))
     conn.commit()
     conn.close()
+
+def set_user_notifications(user_id, enabled: bool):
+    conn = sqlite3.connect(DATABASE)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET notifications=? WHERE user_id=?", (1 if enabled else 0, user_id))
+    conn.commit()
+    conn.close()
+
+def get_user_notifications(user_id):
+    conn = sqlite3.connect(DATABASE)
+    cur = conn.cursor()
+    cur.execute("SELECT notifications FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 1  # по умолчанию уведомления включены
 
 # ---------- Работа с услугами ----------
 def get_services():
@@ -175,24 +191,35 @@ def get_user_appointments(user_id):
     conn.close()
     return apps
 
-def cancel_appointment(appointment_id, user_id):
-    """Отмена записи (только если принадлежит пользователю)"""
+def get_appointment_by_id(appointment_id, user_id):
+    """Возвращает запись, если она принадлежит пользователю"""
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
-    # Проверим, что запись принадлежит этому пользователю и не отменена/не выполнена
-    cur.execute("SELECT user_id, appointment_date, appointment_time, status FROM appointments WHERE id=?", (appointment_id,))
+    cur.execute('''
+        SELECT id, user_id, service_id, appointment_date, appointment_time, status
+        FROM appointments WHERE id=? AND user_id=?
+    ''', (appointment_id, user_id))
     row = cur.fetchone()
-    if not row or row[0] != user_id or row[3] in ('cancelled', 'done'):
-        conn.close()
-        return False
-    cur.execute("UPDATE appointments SET status='cancelled' WHERE id=?", (appointment_id,))
-    release_slot(row[1], row[2])
-    conn.commit()
     conn.close()
-    return True
+    return row
 
-def get_upcoming_confirmed_appointments():
-    """Для напоминаний (только подтверждённые)"""
+def cancel_appointment(appointment_id):
+    """Отмена записи (без проверки прав)"""
+    conn = sqlite3.connect(DATABASE)
+    cur = conn.cursor()
+    cur.execute("SELECT appointment_date, appointment_time FROM appointments WHERE id=?", (appointment_id,))
+    row = cur.fetchone()
+    if row:
+        cur.execute("UPDATE appointments SET status='cancelled' WHERE id=?", (appointment_id,))
+        release_slot(row[0], row[1])
+        conn.commit()
+        conn.close()
+        return True
+    conn.close()
+    return False
+
+def get_upcoming_appointments_for_reminder():
+    """Возвращает записи со статусом 'confirmed', которые будут через час, и пользователь включил уведомления"""
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
     now = datetime.now()
@@ -203,8 +230,10 @@ def get_upcoming_confirmed_appointments():
         SELECT a.id, a.user_id, s.name, a.appointment_date, a.appointment_time
         FROM appointments a
         JOIN services s ON a.service_id = s.id
+        JOIN users u ON a.user_id = u.user_id
         WHERE a.status='confirmed' 
           AND a.reminded=0
+          AND u.notifications=1
           AND a.appointment_date = ?
           AND a.appointment_time = ?
     ''', (today_str, target_time_str))
@@ -219,12 +248,15 @@ def mark_appointment_reminded(appointment_id):
     conn.commit()
     conn.close()
 
-# ========== FSM для записи ==========
+# ========== FSM состояния ==========
 class AppointmentFSM(StatesGroup):
     choosing_service = State()
     choosing_date = State()
     choosing_time = State()
     confirming = State()
+
+class CancelFSM(StatesGroup):
+    waiting_confirm = State()  # для подтверждения отмены
 
 # ========== Клавиатуры ==========
 def main_menu_keyboard():
@@ -275,13 +307,19 @@ def confirm_inline_keyboard():
     builder.button(text="❌ Отменить", callback_data="confirm_no")
     return builder.as_markup()
 
+def notifications_inline_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Да", callback_data="notif_yes")
+    builder.button(text="❌ Нет", callback_data="notif_no")
+    return builder.as_markup()
+
 def appointments_inline_keyboard(appointments):
     """Клавиатура для списка записей с кнопками отмены"""
     builder = InlineKeyboardBuilder()
     for app in appointments:
         app_id = app[0]
         status_emoji = {'pending':'🕒','confirmed':'✅','cancelled':'❌','done':'✔️'}.get(app[4], '❓')
-        # Если статус позволяет отмену (pending или confirmed), добавляем кнопку
+        # Если статус позволяет отмену (pending или confirmed), добавляем кнопку отмены
         if app[4] in ('pending', 'confirmed'):
             builder.button(text=f"{status_emoji} {app[1]} {app[2]} {app[3]} ❌ Отменить",
                            callback_data=f"cancel_{app_id}")
@@ -289,6 +327,12 @@ def appointments_inline_keyboard(appointments):
             builder.button(text=f"{status_emoji} {app[1]} {app[2]} {app[3]} (отменить нельзя)",
                            callback_data="ignore")
     builder.adjust(1)
+    return builder.as_markup()
+
+def confirm_cancel_inline_keyboard(appointment_id):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Да, отменить", callback_data=f"confirm_cancel_{appointment_id}")
+    builder.button(text="❌ Нет", callback_data="cancel_cancel")
     return builder.as_markup()
 
 # ========== Хэндлеры ==========
@@ -360,9 +404,13 @@ async def confirm_yes(callback: CallbackQuery, state: FSMContext):
     date_str = data['date']
     time_str = data['time']
     appointment_id = create_appointment(user_id, service_id, date_str, time_str)
-    await callback.message.edit_text("✅ Запись подтверждена! Мы ждём вас.")
+    await callback.message.edit_text("✅ Запись создана! Ожидайте подтверждения от администратора.")
     await state.clear()
-    await callback.message.answer("Хотите получать напоминания о записи? Они будут приходить за час до визита.")
+    # Спрашиваем про уведомления
+    await callback.message.answer(
+        "Хотите получать напоминания о записи? Они будут приходить за час до визита.",
+        reply_markup=notifications_inline_keyboard()
+    )
     await callback.answer()
 
 @dp.callback_query(StateFilter(AppointmentFSM.confirming), F.data == "confirm_no")
@@ -371,6 +419,19 @@ async def confirm_no(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
 
+# ---------- Настройка уведомлений ----------
+@dp.callback_query(F.data.in_(["notif_yes", "notif_no"]))
+async def set_notifications(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    enabled = (callback.data == "notif_yes")
+    set_user_notifications(user_id, enabled)
+    if enabled:
+        await callback.message.edit_text("✅ Вы будете получать напоминания о записях.")
+    else:
+        await callback.message.edit_text("❌ Напоминания отключены. Вы можете изменить это позже в настройках (функция появится позже).")
+    await callback.answer()
+
+# ---------- Просмотр и отмена записей ----------
 @dp.message(F.text == "📋 Мои записи")
 async def my_appointments(message: Message):
     user_id = message.from_user.id
@@ -378,23 +439,58 @@ async def my_appointments(message: Message):
     if not apps:
         await message.answer("У вас пока нет записей.")
         return
-    # Отправляем список с инлайн-кнопками для отмены
     await message.answer("Ваши записи:", reply_markup=appointments_inline_keyboard(apps))
 
 @dp.callback_query(F.data.startswith("cancel_"))
-async def cancel_my_appointment(callback: CallbackQuery):
+async def start_cancel_appointment(callback: CallbackQuery, state: FSMContext):
     app_id = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
-    if cancel_appointment(app_id, user_id):
+    # Проверим, что запись существует и принадлежит пользователю
+    app = get_appointment_by_id(app_id, user_id)
+    if not app:
+        await callback.message.edit_text("Запись не найдена или уже удалена.")
+        await callback.answer()
+        return
+    if app[5] not in ('pending', 'confirmed'):
+        await callback.message.edit_text("Эту запись уже нельзя отменить (она выполнена или отменена).")
+        await callback.answer()
+        return
+    # Сохраняем ID записи в состоянии
+    await state.update_data(cancel_app_id=app_id)
+    await state.set_state(CancelFSM.waiting_confirm)
+    await callback.message.edit_text(
+        f"❓ Вы уверены, что хотите отменить запись на {app[3]} в {app[4]}?",
+        reply_markup=confirm_cancel_inline_keyboard(app_id)
+    )
+    await callback.answer()
+
+@dp.callback_query(StateFilter(CancelFSM.waiting_confirm), F.data.startswith("confirm_cancel_"))
+async def confirm_cancel(callback: CallbackQuery, state: FSMContext):
+    app_id = int(callback.data.split("_")[2])
+    data = await state.get_data()
+    if data.get("cancel_app_id") != app_id:
+        await callback.message.edit_text("Ошибка: данные устарели. Попробуйте снова.")
+        await state.clear()
+        await callback.answer()
+        return
+    if cancel_appointment(app_id):
         await callback.message.edit_text("✅ Запись успешно отменена.")
     else:
-        await callback.message.edit_text("❌ Не удалось отменить запись (возможно, она уже отменена или выполнена).")
+        await callback.message.edit_text("❌ Не удалось отменить запись.")
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(StateFilter(CancelFSM.waiting_confirm), F.data == "cancel_cancel")
+async def abort_cancel(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Отмена отмены (действие не выполнено).")
+    await state.clear()
     await callback.answer()
 
 @dp.callback_query(F.data == "ignore")
 async def ignore_callback(callback: CallbackQuery):
     await callback.answer("Это действие недоступно.", show_alert=True)
 
+# ---------- Информационные разделы ----------
 @dp.message(F.text == "💇 Услуги и цены")
 async def show_services(message: Message):
     services = get_services()
@@ -433,7 +529,7 @@ async def unknown_message(message: Message):
 async def reminder_scheduler():
     while True:
         try:
-            appointments = get_upcoming_confirmed_appointments()
+            appointments = get_upcoming_appointments_for_reminder()
             for app_id, user_id, service_name, app_date, app_time in appointments:
                 try:
                     await bot.send_message(
