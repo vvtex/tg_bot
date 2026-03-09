@@ -245,10 +245,7 @@ def get_upcoming_confirmed_appointments():
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
     now = datetime.now()
-    # Время через час (с запасом в 2 минуты, чтобы не пропустить из-за задержек)
     target_time = now + timedelta(minutes=60)
-    # Ищем записи на сегодня, время которых совпадает с target_time с точностью до минуты
-    # (упрощённо: appointment_date = today, appointment_time = target_time.strftime("%H:%M"))
     today_str = now.date().isoformat()
     target_time_str = target_time.strftime("%H:%M")
     cur.execute('''
@@ -778,7 +775,7 @@ async def reminder_scheduler():
                     logging.info(f"Reminder sent for appointment {app_id}")
                 except Exception as e:
                     logging.error(f"Failed to send reminder to {user_id}: {e}")
-            await asyncio.sleep(60)  # проверка каждые 60 секунд
+            await asyncio.sleep(60)
         except Exception as e:
             logging.error(f"Error in reminder_scheduler: {e}")
             await asyncio.sleep(60)
@@ -787,7 +784,6 @@ async def reminder_scheduler():
 async def main():
     init_db()
     generate_slots(days_ahead=7)
-    # Запускаем фоновую задачу напоминаний
     asyncio.create_task(reminder_scheduler())
     await dp.start_polling(bot)
 
