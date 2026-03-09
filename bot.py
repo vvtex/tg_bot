@@ -16,23 +16,23 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, CallbackQuery, KeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
-# ========== Конфигурация ==========
+# ========== Конфигурация из переменных окружения ==========
 API_TOKEN = os.getenv("API_TOKEN")
 if not API_TOKEN:
     raise ValueError("❌ Переменная окружения API_TOKEN не задана!")
 
-EMAIL = os.getenv("EMAIL")
-TG_ADMIN = os.getenv("TG_ADMIN")
+EMAIL = os.getenv("EMAIL")          # может быть пустым
+TG_ADMIN = os.getenv("TG_ADMIN")    # может быть пустым (числовой ID)
 if TG_ADMIN:
     try:
         TG_ADMIN = int(TG_ADMIN)
     except ValueError:
-        logging.warning("TG_ADMIN должен быть числом (ID). Уведомления в Telegram отключены.")
+        logging.warning("TG_ADMIN должен быть числом. Уведомления в Telegram отключены.")
         TG_ADMIN = None
 
 DATABASE = "barbershop.sqlt"
 
-# Настройки SMTP
+# Настройки SMTP (если нужно, задайте переменные)
 SMTP_SERVER = os.getenv("SMTP_SERVER", "localhost")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 25))
 SMTP_LOGIN = os.getenv("SMTP_LOGIN")
@@ -40,19 +40,19 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
 logging.basicConfig(level=logging.INFO)
 
-# Блокировка для доступа к БД (чтобы избежать "database is locked")
+# Блокировка для доступа к SQLite
 db_lock = Lock()
 
 # ========== Вспомогательная функция для выполнения запросов в потоке ==========
 async def run_db_query(func, *args, **kwargs):
-    """Запускает синхронную функцию работы с БД в отдельном потоке с блокировкой"""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
-# ========== Инициализация БД (выполняется при старте, блокировка не нужна) ==========
+# ========== Инициализация БД ==========
 def init_db_sync():
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
+    # Пользователи
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -63,6 +63,7 @@ def init_db_sync():
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Услуги
     cur.execute('''
         CREATE TABLE IF NOT EXISTS services (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,6 +72,7 @@ def init_db_sync():
             price INTEGER
         )
     ''')
+    # Записи
     cur.execute('''
         CREATE TABLE IF NOT EXISTS appointments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,6 +87,7 @@ def init_db_sync():
             FOREIGN KEY(service_id) REFERENCES services(id)
         )
     ''')
+    # Слоты
     cur.execute('''
         CREATE TABLE IF NOT EXISTS slots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,6 +96,7 @@ def init_db_sync():
             is_available INTEGER DEFAULT 1
         )
     ''')
+    # Добавим услуги по умолчанию
     cur.execute("SELECT COUNT(*) FROM services")
     if cur.fetchone()[0] == 0:
         services = [
@@ -107,7 +111,6 @@ def init_db_sync():
     conn.close()
 
 def init_db():
-    # Синхронная инициализация при запуске
     init_db_sync()
 
 # ---------- Пользователи ----------
@@ -357,7 +360,6 @@ def cancel_appointment_sync(appointment_id):
         if row:
             cur.execute("UPDATE appointments SET status='cancelled' WHERE id=?", (appointment_id,))
             conn.commit()
-            # освобождаем слот отдельным запросом
             release_slot_sync(row[0], row[1])
             conn.close()
             return True
@@ -368,7 +370,6 @@ async def cancel_appointment(appointment_id):
     return await run_db_query(cancel_appointment_sync, appointment_id)
 
 async def delete_expired_appointments():
-    # Эта функция уже асинхронная, но внутри использует синхронные вызовы с блокировкой
     with db_lock:
         conn = sqlite3.connect(DATABASE)
         cur = conn.cursor()
@@ -384,9 +385,9 @@ async def delete_expired_appointments():
             app_dt = datetime.strptime(f"{d_str} {t_str}", "%Y-%m-%d %H:%M")
             if app_dt + timedelta(minutes=1) < now:
                 expired.append((app_id, user_id, d_str, t_str))
-        
+
         for app_id, user_id, d_str, t_str in expired:
-            details = await get_appointment_details(app_id)  # вызов с блокировкой внутри
+            details = await get_appointment_details(app_id)
             cur.execute("DELETE FROM appointments WHERE id=?", (app_id,))
             release_slot_sync(d_str, t_str)
             conn.commit()
@@ -399,6 +400,7 @@ async def delete_expired_appointments():
                 )
         conn.close()
 
+# ---------- Для напоминаний ----------
 def get_upcoming_appointments_for_reminder_sync():
     with db_lock:
         conn = sqlite3.connect(DATABASE)
@@ -486,7 +488,7 @@ class AppointmentFSM(StatesGroup):
 class CancelFSM(StatesGroup):
     waiting_confirm = State()
 
-# ========== Клавиатуры (без изменений) ==========
+# ========== Клавиатуры ==========
 def main_menu_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.add(KeyboardButton(text="📅 Записаться"))
@@ -503,9 +505,7 @@ def cancel_keyboard():
     return builder.as_markup(resize_keyboard=True)
 
 def services_inline_keyboard():
-    services = asyncio.run(get_services())  # ВНИМАНИЕ: здесь нужно быть осторожным, но это выполняется при старте, пока нет цикла событий? Лучше сделать асинхронную инициализацию клавиатур, но для простоты оставим синхронную версию. Заменим на вызов синхронной функции.
-    # Так как клавиатуры создаются до запуска цикла событий, используем синхронную версию:
-    services = get_services_sync()
+    services = get_services_sync()  # синхронно, т.к. вызывается до запуска поллинга
     builder = InlineKeyboardBuilder()
     for s in services:
         builder.button(text=f"{s[1]} - {s[3]} руб.", callback_data=f"service_{s[0]}")
@@ -524,7 +524,7 @@ def dates_inline_keyboard():
     return builder.as_markup()
 
 def times_inline_keyboard(date_str):
-    slots = get_available_slots_for_date_sync(date_str)  # синхронная версия
+    slots = get_available_slots_for_date_sync(date_str)
     builder = InlineKeyboardBuilder()
     for t in slots:
         builder.button(text=t, callback_data=f"time_{t}")
@@ -603,7 +603,7 @@ async def date_chosen(callback: CallbackQuery, state: FSMContext):
         return
     await callback.message.edit_text(f"Выбрана дата {date_str}. Теперь выберите время:")
     await state.set_state(AppointmentFSM.choosing_time)
-    # Передаём слоты в клавиатуру
+    # Показываем клавиатуру с доступным временем
     kb = times_inline_keyboard(date_str)  # используем синхронную версию, т.к. слоты уже получили
     await callback.message.answer("Выберите время:", reply_markup=kb)
     await callback.answer()
@@ -659,12 +659,12 @@ async def confirm_yes(callback: CallbackQuery, state: FSMContext):
     time_str = data['time']
     client_name = data.get('client_name')
     client_phone = data.get('client_phone')
-    
+
     if client_name and client_phone:
         await update_user_contact(user_id, client_name, client_phone)
-    
+
     appointment_id = await create_appointment(user_id, service_id, date_str, time_str)
-    
+
     service = await get_service(service_id)
     await send_admin_notification(
         f"✅ Новая запись\n"
@@ -674,7 +674,7 @@ async def confirm_yes(callback: CallbackQuery, state: FSMContext):
         f"Дата: {date_str}\n"
         f"Время: {time_str}"
     )
-    
+
     await callback.message.edit_text("✅ Запись подтверждена! Мы ждём вас.")
     await state.clear()
     await callback.message.answer(
@@ -741,7 +741,7 @@ async def confirm_cancel(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         await callback.answer()
         return
-    
+
     details = await get_appointment_details(app_id)
     if await cancel_appointment(app_id):
         await callback.message.edit_text("✅ Запись успешно отменена.")
@@ -834,7 +834,7 @@ async def cleaner_scheduler():
 
 # ========== Запуск ==========
 async def main():
-    init_db()  # синхронная инициализация
+    init_db()
     await generate_slots(days_ahead=7)
     asyncio.create_task(reminder_scheduler())
     asyncio.create_task(cleaner_scheduler())
