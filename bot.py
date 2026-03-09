@@ -13,17 +13,21 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 import sqlite3
 
 # ========== Configuration from environment variables ==========
-# Основной токен бота (на хостинге должна быть задана переменная API_TOKEN)
-API_TOKEN = os.getenv("API_TOKEN", "YOUR_BOT_TOKEN")  # если переменная не задана, используется заглушка
+# Обязательно должны быть заданы: API_TOKEN и ADMIN_ID
+API_TOKEN = os.getenv("API_TOKEN")
+if not API_TOKEN:
+    raise ValueError("❌ Переменная окружения API_TOKEN не задана! Укажите токен бота.")
 
-# ID владельца (администратора) — пробуем взять из ADMIN_ID, затем из USER_ID, иначе значение по умолчанию
-ADMIN_ID = int(os.getenv("ADMIN_ID", os.getenv("USER_ID", "123456789")))
+ADMIN_ID_STR = os.getenv("ADMIN_ID")
+if not ADMIN_ID_STR:
+    raise ValueError("❌ Переменная окружения ADMIN_ID не задана! Укажите ID владельца (число).")
+try:
+    ADMIN_ID = int(ADMIN_ID_STR)
+except ValueError:
+    raise ValueError(f"❌ ADMIN_ID должно быть числом, а получено: '{ADMIN_ID_STR}'")
 
-# Остальные переменные окружения, предоставляемые хостингом, не используются напрямую в коде,
-# но их наличие не влияет на работу бота.
-# (BOTHOST_BILLING_STATUS, BOTHOST_CREATED_AT, и т.д. — можно игнорировать)
-
-DATABASE = "barbershop.db"
+# Имя файла базы данных (можно изменить)
+DATABASE = "barbershop.sqlt"
 
 # ========== Logging ==========
 logging.basicConfig(level=logging.INFO)
