@@ -1,6 +1,8 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta, date
+import os
+import sqlite3
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -9,38 +11,28 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, CallbackQuery, KeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
-import sqlite3
 
 # ========== Конфигурация ==========
-# ⚠️ Впишите сюда свой Telegram ID (узнать можно у @userinfobot)
-OWNER_ID = 123456789  # замените на ваш ID
-
-# Токен бота (берётся из переменной окружения или впишите прямо сюда)
-import os
-API_TOKEN = os.getenv("API_TOKEN", "YOUR_BOT_TOKEN")  # если не задано, используйте заглушку
-
-# Имя файла базы данных
+API_TOKEN = os.getenv("API_TOKEN", "YOUR_BOT_TOKEN")  # токен бота (можно вписать напрямую)
 DATABASE = "barbershop.sqlt"
 
-# ========== Logging ==========
 logging.basicConfig(level=logging.INFO)
 
-# ========== Database setup ==========
+# ========== Инициализация БД ==========
 def init_db():
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
-    # Таблица пользователей
+    # Пользователи (роль больше не нужна, но оставим для совместимости)
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             full_name TEXT,
             phone TEXT,
-            role TEXT DEFAULT 'visitor',
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Таблица услуг
+    # Услуги
     cur.execute('''
         CREATE TABLE IF NOT EXISTS services (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +41,7 @@ def init_db():
             price INTEGER
         )
     ''')
-    # Таблица записей
+    # Записи (статус теперь только для пользователя: pending, confirmed, cancelled, done)
     cur.execute('''
         CREATE TABLE IF NOT EXISTS appointments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,7 +56,7 @@ def init_db():
             FOREIGN KEY(service_id) REFERENCES services(id)
         )
     ''')
-    # Таблица свободных слотов
+    # Слоты
     cur.execute('''
         CREATE TABLE IF NOT EXISTS slots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,43 +79,16 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Функции для работы с пользователями
+# ---------- Работа с пользователями ----------
 def register_user(user_id, username, full_name):
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
     cur.execute("INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?,?,?)",
                 (user_id, username, full_name))
-    # Если пользователь совпадает с владельцем, назначаем роль owner
-    if user_id == OWNER_ID:
-        cur.execute("UPDATE users SET role='owner' WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
 
-def get_user_role(user_id):
-    conn = sqlite3.connect(DATABASE)
-    cur = conn.cursor()
-    cur.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
-    result = cur.fetchone()
-    conn.close()
-    return result[0] if result else 'visitor'
-
-def get_all_visitors():
-    conn = sqlite3.connect(DATABASE)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users WHERE role='visitor'")
-    result = [row[0] for row in cur.fetchall()]
-    conn.close()
-    return result
-
-def get_all_moderators():
-    conn = sqlite3.connect(DATABASE)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, username, full_name FROM users WHERE role='moderator'")
-    mods = cur.fetchall()
-    conn.close()
-    return mods
-
-# Функции для услуг
+# ---------- Работа с услугами ----------
 def get_services():
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
@@ -140,7 +105,7 @@ def get_service(service_id):
     conn.close()
     return service
 
-# Функции для слотов
+# ---------- Работа со слотами ----------
 def generate_slots(days_ahead=7):
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
@@ -182,7 +147,7 @@ def release_slot(date_str, time_str):
     conn.commit()
     conn.close()
 
-# Функции для записей
+# ---------- Работа с записями ----------
 def create_appointment(user_id, service_id, date_str, time_str):
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
@@ -210,35 +175,24 @@ def get_user_appointments(user_id):
     conn.close()
     return apps
 
-def get_all_appointments():
+def cancel_appointment(appointment_id, user_id):
+    """Отмена записи (только если принадлежит пользователю)"""
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
-    cur.execute('''
-        SELECT a.id, u.full_name, u.username, s.name, a.appointment_date, a.appointment_time, a.status
-        FROM appointments a
-        JOIN users u ON a.user_id = u.user_id
-        JOIN services s ON a.service_id = s.id
-        ORDER BY a.appointment_date DESC, a.appointment_time DESC
-    ''')
-    apps = cur.fetchall()
-    conn.close()
-    return apps
-
-def update_appointment_status(appointment_id, status):
-    conn = sqlite3.connect(DATABASE)
-    cur = conn.cursor()
-    cur.execute("UPDATE appointments SET status=? WHERE id=?", (status, appointment_id))
-    if status == 'cancelled':
-        cur.execute("SELECT appointment_date, appointment_time FROM appointments WHERE id=?", (appointment_id,))
-        row = cur.fetchone()
-        if row:
-            release_slot(row[0], row[1])
+    # Проверим, что запись принадлежит этому пользователю и не отменена/не выполнена
+    cur.execute("SELECT user_id, appointment_date, appointment_time, status FROM appointments WHERE id=?", (appointment_id,))
+    row = cur.fetchone()
+    if not row or row[0] != user_id or row[3] in ('cancelled', 'done'):
+        conn.close()
+        return False
+    cur.execute("UPDATE appointments SET status='cancelled' WHERE id=?", (appointment_id,))
+    release_slot(row[1], row[2])
     conn.commit()
     conn.close()
+    return True
 
-# Функция для получения предстоящих подтверждённых записей, которые ещё не получили уведомление
 def get_upcoming_confirmed_appointments():
-    """Возвращает список записей (id, user_id, service_name, date, time), которые произойдут через 60±1 минуту"""
+    """Для напоминаний (только подтверждённые)"""
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
     now = datetime.now()
@@ -265,46 +219,21 @@ def mark_appointment_reminded(appointment_id):
     conn.commit()
     conn.close()
 
-# ========== FSM States ==========
+# ========== FSM для записи ==========
 class AppointmentFSM(StatesGroup):
     choosing_service = State()
     choosing_date = State()
     choosing_time = State()
     confirming = State()
 
-class BroadcastFSM(StatesGroup):
-    waiting_for_message = State()
-
-# ========== Проверки ролей ==========
-def is_owner(user_id: int) -> bool:
-    return user_id == OWNER_ID  # владелец только один, задан в коде
-
-def is_moderator_or_owner(user_id: int) -> bool:
-    # В этой версии модераторов нет, только владелец имеет доступ к админ-функциям
-    return is_owner(user_id)
-
-# ========== Keyboards ==========
-def main_menu_keyboard(role):
+# ========== Клавиатуры ==========
+def main_menu_keyboard():
     builder = ReplyKeyboardBuilder()
-    if role == 'owner':
-        builder.add(KeyboardButton(text="📅 Записи на сегодня"))
-        builder.add(KeyboardButton(text="📋 Все записи"))
-        builder.add(KeyboardButton(text="✅ Подтвердить запись"))
-        builder.add(KeyboardButton(text="❌ Отменить запись"))
-        builder.add(KeyboardButton(text="➕ Добавить слот"))
-        builder.add(KeyboardButton(text="📢 Рассылка"))
-        builder.add(KeyboardButton(text="📊 Статистика"))
-        builder.add(KeyboardButton(text="📋 Мои записи"))
-        builder.add(KeyboardButton(text="📅 Записаться"))
-        builder.add(KeyboardButton(text="💇 Услуги и цены"))
-        builder.add(KeyboardButton(text="📍 Контакты"))
-        builder.add(KeyboardButton(text="🔥 Акции"))
-    else:  # для всех остальных (посетителей)
-        builder.add(KeyboardButton(text="📅 Записаться"))
-        builder.add(KeyboardButton(text="📋 Мои записи"))
-        builder.add(KeyboardButton(text="💇 Услуги и цены"))
-        builder.add(KeyboardButton(text="📍 Контакты"))
-        builder.add(KeyboardButton(text="🔥 Акции"))
+    builder.add(KeyboardButton(text="📅 Записаться"))
+    builder.add(KeyboardButton(text="📋 Мои записи"))
+    builder.add(KeyboardButton(text="💇 Услуги и цены"))
+    builder.add(KeyboardButton(text="📍 Контакты"))
+    builder.add(KeyboardButton(text="🔥 Акции"))
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
@@ -346,7 +275,23 @@ def confirm_inline_keyboard():
     builder.button(text="❌ Отменить", callback_data="confirm_no")
     return builder.as_markup()
 
-# ========== Handlers ==========
+def appointments_inline_keyboard(appointments):
+    """Клавиатура для списка записей с кнопками отмены"""
+    builder = InlineKeyboardBuilder()
+    for app in appointments:
+        app_id = app[0]
+        status_emoji = {'pending':'🕒','confirmed':'✅','cancelled':'❌','done':'✔️'}.get(app[4], '❓')
+        # Если статус позволяет отмену (pending или confirmed), добавляем кнопку
+        if app[4] in ('pending', 'confirmed'):
+            builder.button(text=f"{status_emoji} {app[1]} {app[2]} {app[3]} ❌ Отменить",
+                           callback_data=f"cancel_{app_id}")
+        else:
+            builder.button(text=f"{status_emoji} {app[1]} {app[2]} {app[3]} (отменить нельзя)",
+                           callback_data="ignore")
+    builder.adjust(1)
+    return builder.as_markup()
+
+# ========== Хэндлеры ==========
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -354,13 +299,12 @@ dp = Dispatcher(storage=MemoryStorage())
 async def cmd_start(message: Message):
     user = message.from_user
     register_user(user.id, user.username, user.full_name)
-    role = get_user_role(user.id)
     welcome_text = (
         f"👋 Добро пожаловать в парикмахерскую 'Стиль', {user.full_name}!\n\n"
         "Мы предлагаем профессиональные услуги по стрижке и укладке.\n"
         "Запишитесь сейчас и получите скидку 10% на первое посещение! 🎁"
     )
-    await message.answer(welcome_text, reply_markup=main_menu_keyboard(role))
+    await message.answer(welcome_text, reply_markup=main_menu_keyboard())
 
 @dp.message(F.text == "📅 Записаться")
 async def book_appointment(message: Message, state: FSMContext):
@@ -418,7 +362,7 @@ async def confirm_yes(callback: CallbackQuery, state: FSMContext):
     appointment_id = create_appointment(user_id, service_id, date_str, time_str)
     await callback.message.edit_text("✅ Запись подтверждена! Мы ждём вас.")
     await state.clear()
-    await callback.message.answer("Хотите получать напоминания о записи и персональные скидки? Подпишитесь на рассылку (кнопка 'Рассылка' в меню).")
+    await callback.message.answer("Хотите получать напоминания о записи? Они будут приходить за час до визита.")
     await callback.answer()
 
 @dp.callback_query(StateFilter(AppointmentFSM.confirming), F.data == "confirm_no")
@@ -434,11 +378,22 @@ async def my_appointments(message: Message):
     if not apps:
         await message.answer("У вас пока нет записей.")
         return
-    text = "Ваши записи:\n"
-    for app in apps:
-        status_emoji = {'pending':'🕒','confirmed':'✅','cancelled':'❌','done':'✔️'}.get(app[4], '❓')
-        text += f"{status_emoji} {app[1]} - {app[2]} в {app[3]} ({app[4]})\n"
-    await message.answer(text)
+    # Отправляем список с инлайн-кнопками для отмены
+    await message.answer("Ваши записи:", reply_markup=appointments_inline_keyboard(apps))
+
+@dp.callback_query(F.data.startswith("cancel_"))
+async def cancel_my_appointment(callback: CallbackQuery):
+    app_id = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+    if cancel_appointment(app_id, user_id):
+        await callback.message.edit_text("✅ Запись успешно отменена.")
+    else:
+        await callback.message.edit_text("❌ Не удалось отменить запись (возможно, она уже отменена или выполнена).")
+    await callback.answer()
+
+@dp.callback_query(F.data == "ignore")
+async def ignore_callback(callback: CallbackQuery):
+    await callback.answer("Это действие недоступно.", show_alert=True)
 
 @dp.message(F.text == "💇 Услуги и цены")
 async def show_services(message: Message):
@@ -465,204 +420,17 @@ async def show_promos(message: Message):
             "Подпишитесь на рассылку, чтобы не пропустить новые акции!")
     await message.answer(text)
 
-# --- Функции, доступные только владельцу ---
-@dp.message(F.text == "📅 Записи на сегодня")
-async def today_appointments(message: Message):
-    if not is_owner(message.from_user.id):
-        await message.answer("Нет доступа.")
-        return
-    today_str = date.today().isoformat()
-    conn = sqlite3.connect(DATABASE)
-    cur = conn.cursor()
-    cur.execute('''
-        SELECT a.id, u.full_name, s.name, a.appointment_time, a.status
-        FROM appointments a
-        JOIN users u ON a.user_id = u.user_id
-        JOIN services s ON a.service_id = s.id
-        WHERE a.appointment_date=?
-        ORDER BY a.appointment_time
-    ''', (today_str,))
-    rows = cur.fetchall()
-    conn.close()
-    if not rows:
-        await message.answer("На сегодня записей нет.")
-        return
-    text = "📅 Записи на сегодня:\n"
-    for r in rows:
-        status_emoji = {'pending':'🕒','confirmed':'✅','cancelled':'❌','done':'✔️'}.get(r[4], '❓')
-        text += f"{r[0]}. {r[1]} - {r[2]} в {r[3]} {status_emoji}\n"
-    await message.answer(text)
-
-@dp.message(F.text == "📋 Все записи")
-async def all_appointments(message: Message):
-    if not is_owner(message.from_user.id):
-        await message.answer("Нет доступа.")
-        return
-    apps = get_all_appointments()
-    if not apps:
-        await message.answer("Записей нет.")
-        return
-    text = "Все записи:\n"
-    for a in apps:
-        status_emoji = {'pending':'🕒','confirmed':'✅','cancelled':'❌','done':'✔️'}.get(a[6], '❓')
-        text += f"{a[0]}. {a[1]} (@{a[2]}) - {a[3]} {a[4]} {a[5]} {status_emoji}\n"
-        if len(text) > 3000:
-            await message.answer(text)
-            text = ""
-    if text:
-        await message.answer(text)
-
-@dp.message(F.text == "✅ Подтвердить запись")
-async def confirm_appointment_prompt(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await message.answer("Нет доступа.")
-        return
-    await message.answer("Введите ID записи для подтверждения:")
-    await state.set_state("waiting_confirm_id")
-
-@dp.message(StateFilter("waiting_confirm_id"))
-async def confirm_appointment_by_id(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        return
-    try:
-        app_id = int(message.text)
-    except ValueError:
-        await message.answer("Введите число.")
-        return
-    update_appointment_status(app_id, 'confirmed')
-    await message.answer(f"Запись {app_id} подтверждена.")
-    await state.clear()
-
-@dp.message(F.text == "❌ Отменить запись")
-async def cancel_appointment_prompt(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await message.answer("Нет доступа.")
-        return
-    await message.answer("Введите ID записи для отмены:")
-    await state.set_state("waiting_cancel_id")
-
-@dp.message(StateFilter("waiting_cancel_id"))
-async def cancel_appointment_by_id(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        return
-    try:
-        app_id = int(message.text)
-    except ValueError:
-        await message.answer("Введите число.")
-        return
-    update_appointment_status(app_id, 'cancelled')
-    await message.answer(f"Запись {app_id} отменена.")
-    await state.clear()
-
-@dp.message(F.text == "➕ Добавить слот")
-async def add_slot_prompt(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await message.answer("Нет доступа.")
-        return
-    await message.answer("Введите дату и время нового слота в формате ГГГГ-ММ-ДД ЧЧ:ММ (например, 2025-03-15 10:00):")
-    await state.set_state("waiting_slot_data")
-
-@dp.message(StateFilter("waiting_slot_data"))
-async def add_slot(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        return
-    try:
-        date_str, time_str = message.text.strip().split()
-        datetime.strptime(date_str, "%Y-%m-%d")
-        datetime.strptime(time_str, "%H:%M")
-    except Exception:
-        await message.answer("Неверный формат. Попробуйте снова.")
-        return
-    conn = sqlite3.connect(DATABASE)
-    cur = conn.cursor()
-    cur.execute("SELECT is_available FROM slots WHERE slot_date=? AND slot_time=?", (date_str, time_str))
-    row = cur.fetchone()
-    if row:
-        if row[0] == 1:
-            await message.answer("Этот слот уже свободен.")
-        else:
-            await message.answer("Этот слот занят. Сначала отмените запись.")
-    else:
-        cur.execute("INSERT INTO slots (slot_date, slot_time, is_available) VALUES (?,?,1)", (date_str, time_str))
-        conn.commit()
-        await message.answer(f"Слот {date_str} {time_str} добавлен как свободный.")
-    conn.close()
-    await state.clear()
-
-@dp.message(F.text == "📢 Рассылка")
-async def broadcast_prompt(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await message.answer("Нет доступа.")
-        return
-    await message.answer("Введите сообщение для рассылки всем посетителям:")
-    await state.set_state(BroadcastFSM.waiting_for_message)
-
-@dp.message(BroadcastFSM.waiting_for_message)
-async def broadcast_message(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        return
-    text = message.text
-    visitors = get_all_visitors()
-    success = 0
-    fail = 0
-    for uid in visitors:
-        try:
-            await bot.send_message(uid, f"📢 Рассылка:\n\n{text}")
-            success += 1
-        except Exception:
-            fail += 1
-    await message.answer(f"Рассылка завершена. Успешно: {success}, ошибок: {fail}")
-    await state.clear()
-
-@dp.message(F.text == "📊 Статистика")
-async def show_stats(message: Message):
-    if not is_owner(message.from_user.id):
-        await message.answer("Нет доступа.")
-        return
-    conn = sqlite3.connect(DATABASE)
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    total_users = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM appointments")
-    total_apps = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM appointments WHERE status='pending'")
-    pending = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM appointments WHERE status='confirmed'")
-    confirmed = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM appointments WHERE status='cancelled'")
-    cancelled = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM appointments WHERE status='done'")
-    done = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM appointments WHERE appointment_date=?", (date.today().isoformat(),))
-    today_apps = cur.fetchone()[0]
-    conn.close()
-    text = (f"📊 Статистика:\n"
-            f"Всего пользователей: {total_users}\n"
-            f"Всего записей: {total_apps}\n"
-            f" - Ожидают: {pending}\n"
-            f" - Подтверждено: {confirmed}\n"
-            f" - Отменено: {cancelled}\n"
-            f" - Выполнено: {done}\n"
-            f"Записей на сегодня: {today_apps}")
-    await message.answer(text)
-
 @dp.message(F.text == "❌ Отмена")
 async def cancel_action(message: Message, state: FSMContext):
     await state.clear()
-    role = get_user_role(message.from_user.id)
-    await message.answer("Действие отменено.", reply_markup=main_menu_keyboard(role))
+    await message.answer("Действие отменено.", reply_markup=main_menu_keyboard())
 
 @dp.message()
 async def unknown_message(message: Message):
     await message.answer("Извините, я не понимаю. Используйте кнопки меню.")
 
-# ========== Background task for reminders ==========
+# ========== Фоновые напоминания ==========
 async def reminder_scheduler():
-    """Проверяет каждую минуту предстоящие записи и отправляет напоминания за час."""
     while True:
         try:
             appointments = get_upcoming_confirmed_appointments()
@@ -675,12 +443,11 @@ async def reminder_scheduler():
                         f"Ждём вас!"
                     )
                     mark_appointment_reminded(app_id)
-                    logging.info(f"Reminder sent for appointment {app_id}")
                 except Exception as e:
-                    logging.error(f"Failed to send reminder to {user_id}: {e}")
+                    logging.error(f"Reminder error: {e}")
             await asyncio.sleep(60)
         except Exception as e:
-            logging.error(f"Error in reminder_scheduler: {e}")
+            logging.error(f"Scheduler error: {e}")
             await asyncio.sleep(60)
 
 # ========== Запуск ==========
