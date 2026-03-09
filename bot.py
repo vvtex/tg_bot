@@ -16,18 +16,22 @@ from aiogram.types import Message, CallbackQuery, KeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
 # ========== Конфигурация ==========
-API_TOKEN = os.getenv("API_TOKEN", "YOUR_BOT_TOKEN")
-EMAIL = os.getenv("EMAIL")               # email администратора
-TG_ADMIN = os.getenv("TG_ADMIN")         # Telegram ID администратора (число)
+API_TOKEN = os.getenv("API_TOKEN")
+if not API_TOKEN:
+    raise ValueError("❌ Переменная окружения API_TOKEN не задана!")
+
+EMAIL = os.getenv("EMAIL")  # может быть пустым
+TG_ADMIN = os.getenv("TG_ADMIN")  # может быть пустым
 if TG_ADMIN:
     try:
         TG_ADMIN = int(TG_ADMIN)
     except ValueError:
+        logging.warning("TG_ADMIN должен быть числом (ID). Уведомления в Telegram отключены.")
         TG_ADMIN = None
 
 DATABASE = "barbershop.sqlt"
 
-# Настройки SMTP (замените на свои, если нужно)
+# Настройки SMTP (опционально)
 SMTP_SERVER = os.getenv("SMTP_SERVER", "localhost")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 25))
 SMTP_LOGIN = os.getenv("SMTP_LOGIN")
@@ -39,7 +43,6 @@ logging.basicConfig(level=logging.INFO)
 def init_db():
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
-    # Пользователи
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -50,7 +53,6 @@ def init_db():
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Услуги
     cur.execute('''
         CREATE TABLE IF NOT EXISTS services (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,7 +61,6 @@ def init_db():
             price INTEGER
         )
     ''')
-    # Записи (статус сразу confirmed)
     cur.execute('''
         CREATE TABLE IF NOT EXISTS appointments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,7 +75,6 @@ def init_db():
             FOREIGN KEY(service_id) REFERENCES services(id)
         )
     ''')
-    # Слоты
     cur.execute('''
         CREATE TABLE IF NOT EXISTS slots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +83,6 @@ def init_db():
             is_available INTEGER DEFAULT 1
         )
     ''')
-    # Добавим услуги по умолчанию
     cur.execute("SELECT COUNT(*) FROM services")
     if cur.fetchone()[0] == 0:
         services = [
@@ -97,7 +96,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ---------- Работа с пользователями ----------
+# ---------- Пользователи ----------
 def register_user(user_id, username, full_name):
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
@@ -105,6 +104,34 @@ def register_user(user_id, username, full_name):
                 (user_id, username, full_name))
     conn.commit()
     conn.close()
+
+def update_user_contact(user_id, full_name, phone):
+    conn = sqlite3.connect(DATABASE)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET full_name=?, phone=? WHERE user_id=?",
+                (full_name, phone, user_id))
+    conn.commit()
+    conn.close()
+
+def get_user_name(user_id):
+    conn = sqlite3.connect(DATABASE)
+    cur = conn.cursor()
+    cur.execute("SELECT full_name, username FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row and row[0]:
+        return row[0]
+    elif row and row[1]:
+        return f"@{row[1]}"
+    return str(user_id)
+
+def get_user_phone(user_id):
+    conn = sqlite3.connect(DATABASE)
+    cur = conn.cursor()
+    cur.execute("SELECT phone FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 def set_user_notifications(user_id, enabled: bool):
     conn = sqlite3.connect(DATABASE)
@@ -121,17 +148,7 @@ def get_user_notifications(user_id):
     conn.close()
     return row[0] if row else 1
 
-def get_user_name(user_id):
-    conn = sqlite3.connect(DATABASE)
-    cur = conn.cursor()
-    cur.execute("SELECT full_name, username FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        return row[0] or f"@{row[1]}" or str(user_id)
-    return str(user_id)
-
-# ---------- Работа с услугами ----------
+# ---------- Услуги ----------
 def get_services():
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
@@ -148,7 +165,7 @@ def get_service(service_id):
     conn.close()
     return service
 
-# ---------- Работа со слотами ----------
+# ---------- Слоты ----------
 def generate_slots(days_ahead=7):
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
@@ -190,7 +207,7 @@ def release_slot(date_str, time_str):
     conn.commit()
     conn.close()
 
-# ---------- Работа с записями ----------
+# ---------- Записи ----------
 def create_appointment(user_id, service_id, date_str, time_str):
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
@@ -230,11 +247,10 @@ def get_appointment_by_id(appointment_id, user_id):
     return row
 
 def get_appointment_details(appointment_id):
-    """Возвращает информацию о записи для уведомлений"""
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
     cur.execute('''
-        SELECT a.id, u.full_name, u.username, s.name, a.appointment_date, a.appointment_time, a.status
+        SELECT a.id, u.full_name, u.phone, u.username, s.name, a.appointment_date, a.appointment_time, a.status
         FROM appointments a
         JOIN users u ON a.user_id = u.user_id
         JOIN services s ON a.service_id = s.id
@@ -245,16 +261,16 @@ def get_appointment_details(appointment_id):
     if row:
         return {
             'id': row[0],
-            'client_name': row[1] or f"@{row[2]}" or str(row[0]),
-            'service': row[3],
-            'date': row[4],
-            'time': row[5],
-            'status': row[6]
+            'client_name': row[1] or f"@{row[3]}" or str(row[0]),
+            'client_phone': row[2] or 'не указан',
+            'service': row[4],
+            'date': row[5],
+            'time': row[6],
+            'status': row[7]
         }
     return None
 
 def cancel_appointment(appointment_id):
-    """Отмена записи (без проверки прав)"""
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
     cur.execute("SELECT appointment_date, appointment_time FROM appointments WHERE id=?", (appointment_id,))
@@ -268,13 +284,10 @@ def cancel_appointment(appointment_id):
     conn.close()
     return False
 
-def delete_expired_appointments():
-    """Удаляет записи, которые были более 1 минуты назад, и уведомляет администратора"""
+async def delete_expired_appointments():
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
     now = datetime.now()
-    # Ищем записи, дата+время которых меньше текущего времени минус 1 минута
-    # (то есть прошло больше минуты после времени записи)
     expired = []
     cur.execute('''
         SELECT id, user_id, appointment_date, appointment_time, status
@@ -288,25 +301,21 @@ def delete_expired_appointments():
             expired.append((app_id, user_id, d_str, t_str))
     
     for app_id, user_id, d_str, t_str in expired:
-        # Получаем детали до удаления
         details = get_appointment_details(app_id)
-        # Удаляем запись (можно просто пометить как deleted, но по заданию - удаляем)
         cur.execute("DELETE FROM appointments WHERE id=?", (app_id,))
-        # Освобождаем слот
         release_slot(d_str, t_str)
         conn.commit()
-        # Отправляем уведомление об удалении
         if details:
-            send_admin_notification(
+            await send_admin_notification(
                 f"❌ Запись автоматически удалена (время истекло)\n"
-                f"Клиент: {details['client_name']}\n"
+                f"Клиент: {details['client_name']}, тел: {details['client_phone']}\n"
                 f"Услуга: {details['service']}\n"
                 f"Дата: {details['date']} {details['time']}"
             )
     conn.close()
 
 # ---------- Уведомления администратору ----------
-def send_email(to_addr, subject, body):
+async def send_email(to_addr, subject, body):
     if not to_addr:
         return
     try:
@@ -315,32 +324,33 @@ def send_email(to_addr, subject, body):
         msg['To'] = to_addr
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain', 'utf-8'))
-        
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        if SMTP_LOGIN and SMTP_PASSWORD:
-            server.starttls()
-            server.login(SMTP_LOGIN, SMTP_PASSWORD)
-        server.send_message(msg)
-        server.quit()
+
+        loop = asyncio.get_event_loop()
+        def send():
+            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+            if SMTP_LOGIN and SMTP_PASSWORD:
+                server.starttls()
+                server.login(SMTP_LOGIN, SMTP_PASSWORD)
+            server.send_message(msg)
+            server.quit()
+        await loop.run_in_executor(None, send)
         logging.info(f"Email sent to {to_addr}")
     except Exception as e:
         logging.error(f"Failed to send email: {e}")
 
-def send_telegram(chat_id, text):
+async def send_telegram(chat_id, text):
     if not chat_id:
         return
     try:
-        # Используем глобальный объект bot
-        asyncio.create_task(bot.send_message(chat_id, text))
+        await bot.send_message(chat_id, text)
     except Exception as e:
         logging.error(f"Failed to send Telegram message: {e}")
 
-def send_admin_notification(text):
-    """Отправляет уведомление администратору на email и в Telegram"""
+async def send_admin_notification(text):
     if EMAIL:
-        send_email(EMAIL, "Уведомление от парикмахерской", text)
+        await send_email(EMAIL, "Уведомление от парикмахерской", text)
     if TG_ADMIN:
-        send_telegram(TG_ADMIN, text)
+        await send_telegram(TG_ADMIN, text)
 
 # ---------- Для напоминаний ----------
 def get_upcoming_appointments_for_reminder():
@@ -377,6 +387,8 @@ class AppointmentFSM(StatesGroup):
     choosing_service = State()
     choosing_date = State()
     choosing_time = State()
+    asking_name = State()
+    asking_phone = State()
     confirming = State()
 
 class CancelFSM(StatesGroup):
@@ -504,34 +516,68 @@ async def date_chosen(callback: CallbackQuery, state: FSMContext):
 async def time_chosen(callback: CallbackQuery, state: FSMContext):
     time_str = callback.data.split("_")[1]
     await state.update_data(time=time_str)
-    data = await state.get_data()
-    service = get_service(data['service_id'])
-    text = (f"📌 Подтвердите запись:\n"
-            f"Услуга: {service[1]}\n"
-            f"Цена: {service[3]} руб.\n"
-            f"Дата: {data['date']}\n"
-            f"Время: {time_str}\n\n"
-            f"Всё верно?")
-    await callback.message.edit_text(text)
-    await state.set_state(AppointmentFSM.confirming)
-    await callback.message.answer("Подтвердите действие:", reply_markup=confirm_inline_keyboard())
+    # Переходим к запросу имени
+    await state.set_state(AppointmentFSM.asking_name)
+    await callback.message.edit_text("Введите ваше имя (как к вам обращаться):")
+    await callback.message.answer("Пожалуйста, введите имя:", reply_markup=cancel_keyboard())
     await callback.answer()
 
-@dp.callback_query(StateFilter(AppointmentFSM.confirming), F.data == "confirm_yes")
+@dp.message(StateFilter(AppointmentFSM.asking_name))
+async def ask_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if not name:
+        await message.answer("Имя не может быть пустым. Введите имя:")
+        return
+    await state.update_data(client_name=name)
+    await state.set_state(AppointmentFSM.asking_phone)
+    await message.answer("Введите ваш номер телефона для связи (например, +79991234567):", reply_markup=cancel_keyboard())
+
+@dp.message(StateFilter(AppointmentFSM.asking_phone))
+async def ask_phone(message: Message, state: FSMContext):
+    phone = message.text.strip()
+    if not phone:
+        await message.answer("Телефон не может быть пустым. Введите номер:")
+        return
+    # Простейшая валидация (можно улучшить)
+    if len(phone) < 5:
+        await message.answer("Слишком короткий номер. Введите корректный номер:")
+        return
+    await state.update_data(client_phone=phone)
+    # Переходим к подтверждению
+    data = await state.get_data()
+    service = get_service(data['service_id'])
+    summary = (f"📌 Пожалуйста, проверьте данные:\n"
+               f"Имя: {data['client_name']}\n"
+               f"Телефон: {data['client_phone']}\n"
+               f"Услуга: {service[1]}\n"
+               f"Цена: {service[3]} руб.\n"
+               f"Дата: {data['date']}\n"
+               f"Время: {data['time']}\n\n"
+               f"Всё верно?")
+    await state.set_state(AppointmentFSM.confirming)
+    await message.answer(summary, reply_markup=confirm_inline_keyboard())
+
+@dp.callback_query(StateFilter(AppointmentFSM.confirming), F.data.in_(['confirm_yes']))
 async def confirm_yes(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     user_id = callback.from_user.id
     service_id = data['service_id']
     date_str = data['date']
     time_str = data['time']
+    client_name = data.get('client_name')
+    client_phone = data.get('client_phone')
+    
+    # Обновляем контактные данные пользователя в БД
+    if client_name and client_phone:
+        update_user_contact(user_id, client_name, client_phone)
+    
     appointment_id = create_appointment(user_id, service_id, date_str, time_str)
     
-    # Уведомление администратору
-    user_name = get_user_name(user_id)
     service = get_service(service_id)
-    send_admin_notification(
+    await send_admin_notification(
         f"✅ Новая запись\n"
-        f"Клиент: {user_name}\n"
+        f"Клиент: {client_name}\n"
+        f"Телефон: {client_phone}\n"
         f"Услуга: {service[1]}\n"
         f"Дата: {date_str}\n"
         f"Время: {time_str}"
@@ -545,14 +591,14 @@ async def confirm_yes(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-@dp.callback_query(StateFilter(AppointmentFSM.confirming), F.data == "confirm_no")
+@dp.callback_query(StateFilter(AppointmentFSM.confirming), F.data.in_(['confirm_no']))
 async def confirm_no(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Запись отменена. Можете начать заново.")
     await state.clear()
     await callback.answer()
 
 # ---------- Настройка уведомлений ----------
-@dp.callback_query(F.data.in_(["notif_yes", "notif_no"]))
+@dp.callback_query(F.data.in_(['notif_yes', 'notif_no']))
 async def set_notifications(callback: CallbackQuery):
     user_id = callback.from_user.id
     enabled = (callback.data == "notif_yes")
@@ -604,15 +650,13 @@ async def confirm_cancel(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     
-    # Получаем детали до отмены
     details = get_appointment_details(app_id)
     if cancel_appointment(app_id):
         await callback.message.edit_text("✅ Запись успешно отменена.")
-        # Уведомление администратору
         if details:
-            send_admin_notification(
+            await send_admin_notification(
                 f"❌ Запись отменена клиентом\n"
-                f"Клиент: {details['client_name']}\n"
+                f"Клиент: {details['client_name']}, тел: {details['client_phone']}\n"
                 f"Услуга: {details['service']}\n"
                 f"Дата: {details['date']} {details['time']}"
             )
@@ -621,13 +665,13 @@ async def confirm_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
 
-@dp.callback_query(StateFilter(CancelFSM.waiting_confirm), F.data == "cancel_cancel")
+@dp.callback_query(StateFilter(CancelFSM.waiting_confirm), F.data.in_(['cancel_cancel']))
 async def abort_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Отмена отмены (действие не выполнено).")
     await state.clear()
     await callback.answer()
 
-@dp.callback_query(F.data == "ignore")
+@dp.callback_query(F.data.in_(['ignore']))
 async def ignore_callback(callback: CallbackQuery):
     await callback.answer("Это действие недоступно.", show_alert=True)
 
@@ -668,7 +712,6 @@ async def unknown_message(message: Message):
 
 # ========== Фоновые задачи ==========
 async def reminder_scheduler():
-    """Напоминания за час"""
     while True:
         try:
             appointments = get_upcoming_appointments_for_reminder()
@@ -689,10 +732,9 @@ async def reminder_scheduler():
             await asyncio.sleep(60)
 
 async def cleaner_scheduler():
-    """Удаление записей, время которых прошло (через 1 минуту после)"""
     while True:
         try:
-            delete_expired_appointments()
+            await delete_expired_appointments()
             await asyncio.sleep(60)
         except Exception as e:
             logging.error(f"Cleaner error: {e}")
