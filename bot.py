@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 from datetime import datetime, timedelta, date
 
 from aiogram import Bot, Dispatcher, types, F
@@ -12,21 +11,15 @@ from aiogram.types import Message, CallbackQuery, KeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 import sqlite3
 
-# ========== Configuration from environment variables ==========
-# Обязательно должны быть заданы: API_TOKEN и ADMIN_ID
-API_TOKEN = os.getenv("API_TOKEN")
-if not API_TOKEN:
-    raise ValueError("❌ Переменная окружения API_TOKEN не задана! Укажите токен бота.")
+# ========== Конфигурация ==========
+# ⚠️ Впишите сюда свой Telegram ID (узнать можно у @userinfobot)
+OWNER_ID = 123456789  # замените на ваш ID
 
-ADMIN_ID_STR = os.getenv("ADMIN_ID")
-if not ADMIN_ID_STR:
-    raise ValueError("❌ Переменная окружения ADMIN_ID не задана! Укажите ID владельца (число).")
-try:
-    ADMIN_ID = int(ADMIN_ID_STR)
-except ValueError:
-    raise ValueError(f"❌ ADMIN_ID должно быть числом, а получено: '{ADMIN_ID_STR}'")
+# Токен бота (берётся из переменной окружения или впишите прямо сюда)
+import os
+API_TOKEN = os.getenv("API_TOKEN", "YOUR_BOT_TOKEN")  # если не задано, используйте заглушку
 
-# Имя файла базы данных (можно изменить)
+# Имя файла базы данных
 DATABASE = "barbershop.sqlt"
 
 # ========== Logging ==========
@@ -56,7 +49,7 @@ def init_db():
             price INTEGER
         )
     ''')
-    # Таблица записей (добавлено поле reminded)
+    # Таблица записей
     cur.execute('''
         CREATE TABLE IF NOT EXISTS appointments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,7 +93,8 @@ def register_user(user_id, username, full_name):
     cur = conn.cursor()
     cur.execute("INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?,?,?)",
                 (user_id, username, full_name))
-    if user_id == ADMIN_ID:
+    # Если пользователь совпадает с владельцем, назначаем роль owner
+    if user_id == OWNER_ID:
         cur.execute("UPDATE users SET role='owner' WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
@@ -112,13 +106,6 @@ def get_user_role(user_id):
     result = cur.fetchone()
     conn.close()
     return result[0] if result else 'visitor'
-
-def set_user_role(user_id, role):
-    conn = sqlite3.connect(DATABASE)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET role=? WHERE user_id=?", (role, user_id))
-    conn.commit()
-    conn.close()
 
 def get_all_visitors():
     conn = sqlite3.connect(DATABASE)
@@ -290,39 +277,34 @@ class BroadcastFSM(StatesGroup):
 
 # ========== Проверки ролей ==========
 def is_owner(user_id: int) -> bool:
-    return get_user_role(user_id) == 'owner'
+    return user_id == OWNER_ID  # владелец только один, задан в коде
 
 def is_moderator_or_owner(user_id: int) -> bool:
-    role = get_user_role(user_id)
-    return role in ('moderator', 'owner')
+    # В этой версии модераторов нет, только владелец имеет доступ к админ-функциям
+    return is_owner(user_id)
 
 # ========== Keyboards ==========
 def main_menu_keyboard(role):
     builder = ReplyKeyboardBuilder()
-    if role == 'visitor':
+    if role == 'owner':
+        builder.add(KeyboardButton(text="📅 Записи на сегодня"))
+        builder.add(KeyboardButton(text="📋 Все записи"))
+        builder.add(KeyboardButton(text="✅ Подтвердить запись"))
+        builder.add(KeyboardButton(text="❌ Отменить запись"))
+        builder.add(KeyboardButton(text="➕ Добавить слот"))
+        builder.add(KeyboardButton(text="📢 Рассылка"))
+        builder.add(KeyboardButton(text="📊 Статистика"))
+        builder.add(KeyboardButton(text="📋 Мои записи"))
+        builder.add(KeyboardButton(text="📅 Записаться"))
+        builder.add(KeyboardButton(text="💇 Услуги и цены"))
+        builder.add(KeyboardButton(text="📍 Контакты"))
+        builder.add(KeyboardButton(text="🔥 Акции"))
+    else:  # для всех остальных (посетителей)
         builder.add(KeyboardButton(text="📅 Записаться"))
         builder.add(KeyboardButton(text="📋 Мои записи"))
         builder.add(KeyboardButton(text="💇 Услуги и цены"))
         builder.add(KeyboardButton(text="📍 Контакты"))
         builder.add(KeyboardButton(text="🔥 Акции"))
-    elif role == 'moderator':
-        builder.add(KeyboardButton(text="📅 Записи на сегодня"))
-        builder.add(KeyboardButton(text="📋 Все записи"))
-        builder.add(KeyboardButton(text="✅ Подтвердить запись"))
-        builder.add(KeyboardButton(text="❌ Отменить запись"))
-        builder.add(KeyboardButton(text="➕ Добавить слот"))
-        builder.add(KeyboardButton(text="📢 Рассылка"))
-        builder.add(KeyboardButton(text="📋 Мои записи"))
-    elif role == 'owner':
-        builder.add(KeyboardButton(text="📅 Записи на сегодня"))
-        builder.add(KeyboardButton(text="📋 Все записи"))
-        builder.add(KeyboardButton(text="✅ Подтвердить запись"))
-        builder.add(KeyboardButton(text="❌ Отменить запись"))
-        builder.add(KeyboardButton(text="➕ Добавить слот"))
-        builder.add(KeyboardButton(text="📢 Рассылка"))
-        builder.add(KeyboardButton(text="👥 Управление модераторами"))
-        builder.add(KeyboardButton(text="📊 Статистика"))
-        builder.add(KeyboardButton(text="📋 Мои записи"))
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
@@ -382,11 +364,6 @@ async def cmd_start(message: Message):
 
 @dp.message(F.text == "📅 Записаться")
 async def book_appointment(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    role = get_user_role(user_id)
-    if role not in ['visitor', 'moderator', 'owner']:
-        await message.answer("У вас нет прав для записи.")
-        return
     await state.set_state(AppointmentFSM.choosing_service)
     await message.answer("Выберите услугу:", reply_markup=services_inline_keyboard())
 
@@ -488,10 +465,10 @@ async def show_promos(message: Message):
             "Подпишитесь на рассылку, чтобы не пропустить новые акции!")
     await message.answer(text)
 
-# --- Модератор и владелец ---
+# --- Функции, доступные только владельцу ---
 @dp.message(F.text == "📅 Записи на сегодня")
 async def today_appointments(message: Message):
-    if not is_moderator_or_owner(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await message.answer("Нет доступа.")
         return
     today_str = date.today().isoformat()
@@ -518,7 +495,7 @@ async def today_appointments(message: Message):
 
 @dp.message(F.text == "📋 Все записи")
 async def all_appointments(message: Message):
-    if not is_moderator_or_owner(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await message.answer("Нет доступа.")
         return
     apps = get_all_appointments()
@@ -537,7 +514,7 @@ async def all_appointments(message: Message):
 
 @dp.message(F.text == "✅ Подтвердить запись")
 async def confirm_appointment_prompt(message: Message, state: FSMContext):
-    if not is_moderator_or_owner(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await message.answer("Нет доступа.")
         return
     await message.answer("Введите ID записи для подтверждения:")
@@ -545,7 +522,7 @@ async def confirm_appointment_prompt(message: Message, state: FSMContext):
 
 @dp.message(StateFilter("waiting_confirm_id"))
 async def confirm_appointment_by_id(message: Message, state: FSMContext):
-    if not is_moderator_or_owner(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return
     try:
@@ -559,7 +536,7 @@ async def confirm_appointment_by_id(message: Message, state: FSMContext):
 
 @dp.message(F.text == "❌ Отменить запись")
 async def cancel_appointment_prompt(message: Message, state: FSMContext):
-    if not is_moderator_or_owner(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await message.answer("Нет доступа.")
         return
     await message.answer("Введите ID записи для отмены:")
@@ -567,7 +544,7 @@ async def cancel_appointment_prompt(message: Message, state: FSMContext):
 
 @dp.message(StateFilter("waiting_cancel_id"))
 async def cancel_appointment_by_id(message: Message, state: FSMContext):
-    if not is_moderator_or_owner(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return
     try:
@@ -581,7 +558,7 @@ async def cancel_appointment_by_id(message: Message, state: FSMContext):
 
 @dp.message(F.text == "➕ Добавить слот")
 async def add_slot_prompt(message: Message, state: FSMContext):
-    if not is_moderator_or_owner(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await message.answer("Нет доступа.")
         return
     await message.answer("Введите дату и время нового слота в формате ГГГГ-ММ-ДД ЧЧ:ММ (например, 2025-03-15 10:00):")
@@ -589,7 +566,7 @@ async def add_slot_prompt(message: Message, state: FSMContext):
 
 @dp.message(StateFilter("waiting_slot_data"))
 async def add_slot(message: Message, state: FSMContext):
-    if not is_moderator_or_owner(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return
     try:
@@ -617,7 +594,7 @@ async def add_slot(message: Message, state: FSMContext):
 
 @dp.message(F.text == "📢 Рассылка")
 async def broadcast_prompt(message: Message, state: FSMContext):
-    if not is_moderator_or_owner(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await message.answer("Нет доступа.")
         return
     await message.answer("Введите сообщение для рассылки всем посетителям:")
@@ -625,7 +602,7 @@ async def broadcast_prompt(message: Message, state: FSMContext):
 
 @dp.message(BroadcastFSM.waiting_for_message)
 async def broadcast_message(message: Message, state: FSMContext):
-    if not is_moderator_or_owner(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return
     text = message.text
@@ -640,90 +617,6 @@ async def broadcast_message(message: Message, state: FSMContext):
             fail += 1
     await message.answer(f"Рассылка завершена. Успешно: {success}, ошибок: {fail}")
     await state.clear()
-
-# ========== Управление модераторами (только для владельца) ==========
-@dp.message(F.text == "👥 Управление модераторами")
-async def manage_moderators(message: Message):
-    if not is_owner(message.from_user.id):
-        await message.answer("Нет доступа.")
-        return
-    mods = get_all_moderators()
-    text = "👥 Текущие модераторы:\n"
-    if mods:
-        for m in mods:
-            text += f"• {m[2]} (@{m[1]}) — ID: {m[0]}\n"
-    else:
-        text += "Список пуст.\n"
-    text += "\nЧтобы добавить модератора, используйте команду:\n/add_moderator <ID>\nЧтобы удалить:\n/remove_moderator <ID>"
-    await message.answer(text)
-
-@dp.message(Command("add_moderator"))
-async def add_moderator(message: Message):
-    """Добавляет модератора (только владелец)"""
-    if not is_owner(message.from_user.id):
-        await message.answer("⛔ Только владелец может назначать модераторов.")
-        return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Использование: /add_moderator user_id")
-        return
-    try:
-        user_id = int(args[1])
-    except ValueError:
-        await message.answer("ID должен быть числом.")
-        return
-
-    conn = sqlite3.connect(DATABASE)
-    cur = conn.cursor()
-    cur.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    if not row:
-        cur.execute("INSERT INTO users (user_id, role) VALUES (?, 'moderator')", (user_id,))
-        conn.commit()
-        conn.close()
-        await message.answer(f"✅ Пользователь {user_id} добавлен в базу и назначен модератором.")
-    else:
-        if row[0] == 'moderator':
-            await message.answer(f"ℹ️ Пользователь {user_id} уже является модератором.")
-        else:
-            cur.execute("UPDATE users SET role='moderator' WHERE user_id=?", (user_id,))
-            conn.commit()
-            conn.close()
-            await message.answer(f"✅ Пользователь {user_id} теперь модератор.")
-    try:
-        await bot.send_message(user_id, "🎉 Вам назначена роль модератора в боте парикмахерской. Теперь вам доступны дополнительные функции.")
-    except:
-        pass
-
-@dp.message(Command("remove_moderator"))
-async def remove_moderator(message: Message):
-    """Снимает права модератора (только владелец)"""
-    if not is_owner(message.from_user.id):
-        await message.answer("⛔ Только владелец может удалять модераторов.")
-        return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Использование: /remove_moderator user_id")
-        return
-    try:
-        user_id = int(args[1])
-    except ValueError:
-        await message.answer("ID должен быть числом.")
-        return
-
-    conn = sqlite3.connect(DATABASE)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET role='visitor' WHERE user_id=? AND role='moderator'", (user_id,))
-    if cur.rowcount == 0:
-        await message.answer("Пользователь не является модератором или не найден.")
-    else:
-        conn.commit()
-        await message.answer(f"✅ У пользователя {user_id} отозваны права модератора.")
-        try:
-            await bot.send_message(user_id, "Ваши права модератора в боте парикмахерской были отозваны.")
-        except:
-            pass
-    conn.close()
 
 @dp.message(F.text == "📊 Статистика")
 async def show_stats(message: Message):
