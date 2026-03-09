@@ -465,7 +465,8 @@ def appointments_inline_keyboard(appointments):
 def confirm_cancel_inline_keyboard(appointment_id):
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Да, отменить", callback_data=f"confirm_cancel_{appointment_id}")
-    builder.button(text="❌ Нет", callback_data="cancel_cancel")
+    # Изменено: теперь callback "abort_cancel" вместо "cancel_cancel"
+    builder.button(text="❌ Нет", callback_data="abort_cancel")
     return builder.as_markup()
 
 # ========== Хэндлеры ==========
@@ -516,7 +517,6 @@ async def date_chosen(callback: CallbackQuery, state: FSMContext):
 async def time_chosen(callback: CallbackQuery, state: FSMContext):
     time_str = callback.data.split("_")[1]
     await state.update_data(time=time_str)
-    # Переходим к запросу имени
     await state.set_state(AppointmentFSM.asking_name)
     await callback.message.edit_text("Введите ваше имя (как к вам обращаться):")
     await callback.message.answer("Пожалуйста, введите имя:", reply_markup=cancel_keyboard())
@@ -538,12 +538,10 @@ async def ask_phone(message: Message, state: FSMContext):
     if not phone:
         await message.answer("Телефон не может быть пустым. Введите номер:")
         return
-    # Простейшая валидация (можно улучшить)
     if len(phone) < 5:
         await message.answer("Слишком короткий номер. Введите корректный номер:")
         return
     await state.update_data(client_phone=phone)
-    # Переходим к подтверждению
     data = await state.get_data()
     service = get_service(data['service_id'])
     summary = (f"📌 Пожалуйста, проверьте данные:\n"
@@ -567,7 +565,6 @@ async def confirm_yes(callback: CallbackQuery, state: FSMContext):
     client_name = data.get('client_name')
     client_phone = data.get('client_phone')
     
-    # Обновляем контактные данные пользователя в БД
     if client_name and client_phone:
         update_user_contact(user_id, client_name, client_phone)
     
@@ -665,7 +662,8 @@ async def confirm_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
 
-@dp.callback_query(StateFilter(CancelFSM.waiting_confirm), F.data.in_(['cancel_cancel']))
+# Изменён хэндлер для кнопки "Нет" при подтверждении отмены
+@dp.callback_query(StateFilter(CancelFSM.waiting_confirm), F.data.in_(['abort_cancel']))
 async def abort_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Отмена отмены (действие не выполнено).")
     await state.clear()
