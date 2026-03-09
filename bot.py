@@ -1,21 +1,28 @@
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta, date
-from typing import Union
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, KeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 import sqlite3
-import os
 
-# ========== Configuration ==========
-BOT_TOKEN = "YOUR_BOT_TOKEN"           # Замените на токен вашего бота
-ADMIN_ID = 123456789                    # Ваш Telegram ID (владелец)
+# ========== Configuration from environment variables ==========
+# Основной токен бота (на хостинге должна быть задана переменная API_TOKEN)
+API_TOKEN = os.getenv("API_TOKEN", "YOUR_BOT_TOKEN")  # если переменная не задана, используется заглушка
+
+# ID владельца (администратора) — пробуем взять из ADMIN_ID, затем из USER_ID, иначе значение по умолчанию
+ADMIN_ID = int(os.getenv("ADMIN_ID", os.getenv("USER_ID", "123456789")))
+
+# Остальные переменные окружения, предоставляемые хостингом, не используются напрямую в коде,
+# но их наличие не влияет на работу бота.
+# (BOTHOST_BILLING_STATUS, BOTHOST_CREATED_AT, и т.д. — можно игнорировать)
+
 DATABASE = "barbershop.db"
 
 # ========== Logging ==========
@@ -103,7 +110,6 @@ def get_user_role(user_id):
     return result[0] if result else 'visitor'
 
 def set_user_role(user_id, role):
-    """Устанавливает роль пользователя (используется только владельцем)"""
     conn = sqlite3.connect(DATABASE)
     cur = conn.cursor()
     cur.execute("UPDATE users SET role=? WHERE user_id=?", (role, user_id))
@@ -355,7 +361,7 @@ def confirm_inline_keyboard():
     return builder.as_markup()
 
 # ========== Handlers ==========
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 @dp.message(Command("start"))
