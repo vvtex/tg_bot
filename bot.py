@@ -3,10 +3,11 @@ import logging
 import smtplib
 import os
 import sqlite3
+import re
 from datetime import datetime, timedelta, date
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from threading import Lock
+from threading import RLock
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -30,7 +31,7 @@ if TG_ADMIN:
         logging.warning("TG_ADMIN должен быть числом (ID). Уведомления в Telegram отключены.")
         TG_ADMIN = None
 
-DATABASE = "barbershop.sqlt"
+DATABASE = "barbershop.db"  # изменил расширение, но можно оставить .sqlt
 
 SMTP_SERVER = os.getenv("SMTP_SERVER", "localhost")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 25))
@@ -39,7 +40,7 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
 logging.basicConfig(level=logging.INFO)
 
-db_lock = Lock()
+db_lock = RLock()  # Используем RLock для возможности повторного захвата
 
 # ========== Вспомогательная функция для выполнения запросов в потоке ==========
 async def run_db_query(func, *args, **kwargs):
@@ -48,60 +49,61 @@ async def run_db_query(func, *args, **kwargs):
 
 # ========== Инициализация БД ==========
 def init_db_sync():
-    conn = sqlite3.connect(DATABASE)
-    cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            full_name TEXT,
-            phone TEXT,
-            notifications INTEGER DEFAULT 1,
-            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS services (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            duration INTEGER DEFAULT 60,
-            price INTEGER
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS appointments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            service_id INTEGER,
-            appointment_date DATE,
-            appointment_time TIME,
-            status TEXT DEFAULT 'confirmed',
-            reminded INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(user_id),
-            FOREIGN KEY(service_id) REFERENCES services(id)
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS slots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            slot_date DATE,
-            slot_time TIME,
-            is_available INTEGER DEFAULT 1
-        )
-    ''')
-    cur.execute("SELECT COUNT(*) FROM services")
-    if cur.fetchone()[0] == 0:
-        services = [
-            ("Мужская стрижка", 30, 800),
-            ("Женская стрижка", 60, 1500),
-            ("Стрижка машинкой", 20, 500),
-            ("Укладка", 30, 600),
-            ("Окрашивание", 120, 3000)
-        ]
-        cur.executemany("INSERT INTO services (name, duration, price) VALUES (?,?,?)", services)
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = sqlite3.connect(DATABASE)
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                phone TEXT,
+                notifications INTEGER DEFAULT 1,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS services (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                duration INTEGER DEFAULT 60,
+                price INTEGER
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS appointments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                service_id INTEGER,
+                appointment_date DATE,
+                appointment_time TIME,
+                status TEXT DEFAULT 'confirmed',
+                reminded INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(user_id),
+                FOREIGN KEY(service_id) REFERENCES services(id)
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS slots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slot_date DATE,
+                slot_time TIME,
+                is_available INTEGER DEFAULT 1
+            )
+        ''')
+        cur.execute("SELECT COUNT(*) FROM services")
+        if cur.fetchone()[0] == 0:
+            services = [
+                ("Мужская стрижка", 30, 800),
+                ("Женская стрижка", 60, 1500),
+                ("Стрижка машинкой", 20, 500),
+                ("Укладка", 30, 600),
+                ("Окрашивание", 120, 3000)
+            ]
+            cur.executemany("INSERT INTO services (name, duration, price) VALUES (?,?,?)", services)
+        conn.commit()
+        conn.close()
 
 def init_db():
     init_db_sync()
@@ -243,17 +245,6 @@ def get_available_slots_for_date_sync(date_str):
 async def get_available_slots_for_date(date_str):
     return await run_db_query(get_available_slots_for_date_sync, date_str)
 
-def book_slot_sync(date_str, time_str):
-    with db_lock:
-        conn = sqlite3.connect(DATABASE)
-        cur = conn.cursor()
-        cur.execute("UPDATE slots SET is_available=0 WHERE slot_date=? AND slot_time=?", (date_str, time_str))
-        conn.commit()
-        conn.close()
-
-async def book_slot(date_str, time_str):
-    await run_db_query(book_slot_sync, date_str, time_str)
-
 def release_slot_sync(date_str, time_str):
     with db_lock:
         conn = sqlite3.connect(DATABASE)
@@ -265,20 +256,37 @@ def release_slot_sync(date_str, time_str):
 async def release_slot(date_str, time_str):
     await run_db_query(release_slot_sync, date_str, time_str)
 
-# ---------- Записи ----------
+# ---------- Записи (с транзакцией) ----------
 def create_appointment_sync(user_id, service_id, date_str, time_str):
     with db_lock:
         conn = sqlite3.connect(DATABASE)
+        conn.isolation_level = None  # отключаем autocommit, будем управлять вручную
         cur = conn.cursor()
-        cur.execute('''
-            INSERT INTO appointments (user_id, service_id, appointment_date, appointment_time, status)
-            VALUES (?,?,?,?, 'confirmed')
-        ''', (user_id, service_id, date_str, time_str))
-        appointment_id = cur.lastrowid
-        conn.commit()
-        conn.close()
-    book_slot_sync(date_str, time_str)
-    return appointment_id
+        try:
+            cur.execute("BEGIN")
+            # Атомарно пытаемся забронировать слот
+            cur.execute(
+                "UPDATE slots SET is_available=0 WHERE slot_date=? AND slot_time=? AND is_available=1",
+                (date_str, time_str)
+            )
+            if cur.rowcount == 0:
+                # Слот уже занят
+                conn.rollback()
+                return None
+
+            # Создаём запись
+            cur.execute('''
+                INSERT INTO appointments (user_id, service_id, appointment_date, appointment_time, status)
+                VALUES (?,?,?,?, 'confirmed')
+            ''', (user_id, service_id, date_str, time_str))
+            appointment_id = cur.lastrowid
+            conn.commit()
+            return appointment_id
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 async def create_appointment(user_id, service_id, date_str, time_str):
     return await run_db_query(create_appointment_sync, user_id, service_id, date_str, time_str)
@@ -348,16 +356,24 @@ def cancel_appointment_sync(appointment_id):
     with db_lock:
         conn = sqlite3.connect(DATABASE)
         cur = conn.cursor()
-        cur.execute("SELECT appointment_date, appointment_time FROM appointments WHERE id=?", (appointment_id,))
-        row = cur.fetchone()
-        if row:
+        try:
+            cur.execute("SELECT appointment_date, appointment_time FROM appointments WHERE id=?", (appointment_id,))
+            row = cur.fetchone()
+            if not row:
+                return False
+            date_str, time_str = row
             cur.execute("UPDATE appointments SET status='cancelled' WHERE id=?", (appointment_id,))
+            if cur.rowcount == 0:
+                return False
+            # Освобождаем слот
+            cur.execute("UPDATE slots SET is_available=1 WHERE slot_date=? AND slot_time=?", (date_str, time_str))
             conn.commit()
-            release_slot_sync(row[0], row[1])
-            conn.close()
             return True
-        conn.close()
-        return False
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 async def cancel_appointment(appointment_id):
     return await run_db_query(cancel_appointment_sync, appointment_id)
@@ -481,7 +497,7 @@ class AppointmentFSM(StatesGroup):
 class CancelFSM(StatesGroup):
     waiting_confirm = State()
 
-# ========== Клавиатуры (только синхронные вызовы) ==========
+# ========== Клавиатуры (вспомогательные) ==========
 def main_menu_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.add(KeyboardButton(text="📅 Записаться"))
@@ -497,8 +513,7 @@ def cancel_keyboard():
     builder.add(KeyboardButton(text="❌ Отмена"))
     return builder.as_markup(resize_keyboard=True)
 
-def services_inline_keyboard():
-    services = get_services_sync()  # синхронный вызов
+def build_services_keyboard(services):
     builder = InlineKeyboardBuilder()
     for s in services:
         builder.button(text=f"{s[1]} - {s[3]} руб.", callback_data=f"service_{s[0]}")
@@ -513,14 +528,15 @@ def dates_inline_keyboard():
         label = d.strftime("%d.%m.%Y")
         callback = f"date_{d.isoformat()}"
         builder.button(text=label, callback_data=callback)
+    builder.button(text="⬅️ Назад к услугам", callback_data="back_to_services")
     builder.adjust(2)
     return builder.as_markup()
 
-def times_inline_keyboard(date_str):
-    slots = get_available_slots_for_date_sync(date_str)  # синхронный вызов
+def build_times_keyboard(slots, date_str):
     builder = InlineKeyboardBuilder()
     for t in slots:
         builder.button(text=t, callback_data=f"time_{t}")
+    builder.button(text="⬅️ Назад к датам", callback_data=f"back_to_dates_{date_str}")
     builder.adjust(3)
     return builder.as_markup()
 
@@ -536,7 +552,7 @@ def notifications_inline_keyboard():
     builder.button(text="❌ Нет", callback_data="notif_no")
     return builder.as_markup()
 
-def appointments_inline_keyboard(appointments):
+def build_appointments_keyboard(appointments):
     builder = InlineKeyboardBuilder()
     for app in appointments:
         app_id = app[0]
@@ -566,22 +582,30 @@ async def cmd_start(message: Message):
     welcome_text = (
         f"👋 Добро пожаловать в парикмахерскую 'Стиль', {user.full_name}!\n\n"
         "Мы предлагаем профессиональные услуги по стрижке и укладке.\n"
-        "Запишитесь сейчас и получите скидку 10% на первое посещение! 🎁"
+        "Запишитесь сейчас и получите скидку 10% на первое посещение! 🎁\n\n"
+        "Используйте кнопки ниже для навигации."
     )
     await message.answer(welcome_text, reply_markup=main_menu_keyboard())
 
 @dp.message(F.text == "📅 Записаться")
 async def book_appointment(message: Message, state: FSMContext):
     await state.set_state(AppointmentFSM.choosing_service)
-    await message.answer("Выберите услугу:", reply_markup=services_inline_keyboard())
+    services = await get_services()
+    if not services:
+        await message.answer("К сожалению, услуги временно недоступны.")
+        return
+    kb = build_services_keyboard(services)
+    await message.answer("👇 Выберите услугу, нажав на кнопку ниже:", reply_markup=kb)
 
 @dp.callback_query(StateFilter(AppointmentFSM.choosing_service), F.data.startswith("service_"))
 async def service_chosen(callback: CallbackQuery, state: FSMContext):
     service_id = int(callback.data.split("_")[1])
     await state.update_data(service_id=service_id)
-    await callback.message.edit_text("Теперь выберите дату:")
-    await state.set_state(AppointmentFSM.choosing_date)
-    await callback.message.answer("Выберите дату:", reply_markup=dates_inline_keyboard())
+    # Редактируем текущее сообщение: убираем клавиатуру услуг, показываем даты
+    await callback.message.edit_text(
+        "📅 Теперь выберите дату. Нажмите на кнопку с нужной датой:",
+        reply_markup=dates_inline_keyboard()
+    )
     await callback.answer()
 
 @dp.callback_query(StateFilter(AppointmentFSM.choosing_date), F.data.startswith("date_"))
@@ -590,23 +614,66 @@ async def date_chosen(callback: CallbackQuery, state: FSMContext):
     await state.update_data(date=date_str)
     slots = await get_available_slots_for_date(date_str)
     if not slots:
-        await callback.message.edit_text("К сожалению, на эту дату нет свободных слотов. Выберите другую дату.")
-        await callback.message.answer("Выберите дату:", reply_markup=dates_inline_keyboard())
+        # Слотов нет – показываем ошибку и оставляем выбор даты
+        await callback.message.edit_text(
+            f"❌ На {date_str} нет свободных слотов.\nВыберите другую дату:",
+            reply_markup=dates_inline_keyboard()
+        )
         await callback.answer()
         return
-    await callback.message.edit_text(f"Выбрана дата {date_str}. Теперь выберите время:")
+    # Сохраняем выбранную дату и переходим к выбору времени
     await state.set_state(AppointmentFSM.choosing_time)
-    kb = times_inline_keyboard(date_str)
-    await callback.message.answer("Выберите время:", reply_markup=kb)
+    await callback.message.edit_text(
+        f"✅ Выбрана дата {date_str}.\nТеперь выберите время:",
+        reply_markup=build_times_keyboard(slots, date_str)
+    )
     await callback.answer()
 
 @dp.callback_query(StateFilter(AppointmentFSM.choosing_time), F.data.startswith("time_"))
 async def time_chosen(callback: CallbackQuery, state: FSMContext):
     time_str = callback.data.split("_")[1]
+    data = await state.get_data()
+    date_str = data.get('date')
+
+    # Проверяем, свободен ли ещё слот
+    available = await get_available_slots_for_date(date_str)
+    if time_str not in available:
+        await callback.answer("❌ Это время уже занято. Выберите другое.", show_alert=True)
+        # Обновляем клавиатуру с актуальными слотами
+        await callback.message.edit_reply_markup(reply_markup=build_times_keyboard(available, date_str))
+        return
+
     await state.update_data(time=time_str)
     await state.set_state(AppointmentFSM.asking_name)
-    await callback.message.edit_text("Введите ваше имя (как к вам обращаться):")
-    await callback.message.answer("Пожалуйста, введите имя:", reply_markup=cancel_keyboard())
+    await callback.message.edit_text(f"🕒 Выбрано время {time_str}.")
+    await callback.message.answer(
+        "Введите ваше имя (как к вам обращаться):\n"
+        "(или нажмите кнопку «❌ Отмена» для выхода)",
+        reply_markup=cancel_keyboard()
+    )
+    await callback.answer()
+
+# Кнопка "Назад к услугам" при выборе даты
+@dp.callback_query(StateFilter(AppointmentFSM.choosing_date), F.data == "back_to_services")
+async def back_to_services(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AppointmentFSM.choosing_service)
+    services = await get_services()
+    await callback.message.edit_text(
+        "👇 Выберите услугу заново:",
+        reply_markup=build_services_keyboard(services)
+    )
+    await callback.answer()
+
+# Кнопка "Назад к датам" при выборе времени
+@dp.callback_query(StateFilter(AppointmentFSM.choosing_time), F.data.startswith("back_to_dates_"))
+async def back_to_dates(callback: CallbackQuery, state: FSMContext):
+    # Извлекаем дату, на которой были (для информации)
+    date_str = callback.data.split("_")[3]  # back_to_dates_2025-03-20
+    await state.set_state(AppointmentFSM.choosing_date)
+    await callback.message.edit_text(
+        "📅 Выберите другую дату:",
+        reply_markup=dates_inline_keyboard()
+    )
     await callback.answer()
 
 @dp.message(StateFilter(AppointmentFSM.asking_name))
@@ -615,9 +682,15 @@ async def ask_name(message: Message, state: FSMContext):
     if not name:
         await message.answer("Имя не может быть пустым. Введите имя:")
         return
+    if len(name) > 100:
+        await message.answer("Слишком длинное имя. Введите имя покороче:")
+        return
     await state.update_data(client_name=name)
     await state.set_state(AppointmentFSM.asking_phone)
-    await message.answer("Введите ваш номер телефона для связи (например, +79991234567):", reply_markup=cancel_keyboard())
+    await message.answer(
+        "Введите ваш номер телефона для связи (например, +79991234567):",
+        reply_markup=cancel_keyboard()
+    )
 
 @dp.message(StateFilter(AppointmentFSM.asking_phone))
 async def ask_phone(message: Message, state: FSMContext):
@@ -625,8 +698,12 @@ async def ask_phone(message: Message, state: FSMContext):
     if not phone:
         await message.answer("Телефон не может быть пустым. Введите номер:")
         return
-    if len(phone) < 5:
-        await message.answer("Слишком короткий номер. Введите корректный номер:")
+    if len(phone) < 5 or len(phone) > 20:
+        await message.answer("Некорректная длина номера. Введите правильный номер:")
+        return
+    # Простейшая проверка: содержит только цифры, +, -, пробелы
+    if not re.match(r'^[\d\s\+\-\(\)]+$', phone):
+        await message.answer("Номер может содержать только цифры, пробелы, знаки +, -, (, ). Попробуйте ещё раз:")
         return
     await state.update_data(client_phone=phone)
     data = await state.get_data()
@@ -656,6 +733,26 @@ async def confirm_yes(callback: CallbackQuery, state: FSMContext):
         await update_user_contact(user_id, client_name, client_phone)
 
     appointment_id = await create_appointment(user_id, service_id, date_str, time_str)
+    if appointment_id is None:
+        # Слот занят (редкая ситуация из-за параллельной записи)
+        await callback.message.edit_text(
+            "❌ К сожалению, выбранное время только что заняли. "
+            "Попробуйте выбрать другое время.",
+            reply_markup=None
+        )
+        await callback.answer()
+        # Вернём пользователя к выбору времени
+        await state.set_state(AppointmentFSM.choosing_time)
+        slots = await get_available_slots_for_date(date_str)
+        if slots:
+            await callback.message.answer(
+                "Выберите другое время:",
+                reply_markup=build_times_keyboard(slots, date_str)
+            )
+        else:
+            await callback.message.answer("На эту дату больше нет свободных слотов. Начните заново.")
+            await state.clear()
+        return
 
     service = await get_service(service_id)
     await send_admin_notification(
@@ -667,17 +764,18 @@ async def confirm_yes(callback: CallbackQuery, state: FSMContext):
         f"Время: {time_str}"
     )
 
-    await callback.message.edit_text("✅ Запись подтверждена! Мы ждём вас.")
-    await state.clear()
-    await callback.message.answer(
-        "Хотите получать напоминания о записи? Они будут приходить за час до визита.",
+    # Редактируем сообщение с подтверждением: добавляем вопрос о напоминаниях
+    await callback.message.edit_text(
+        "✅ Запись подтверждена! Мы ждём вас.\n\n"
+        "Хотите получать напоминания о записи за час до визита?",
         reply_markup=notifications_inline_keyboard()
     )
+    await state.clear()
     await callback.answer()
 
 @dp.callback_query(StateFilter(AppointmentFSM.confirming), F.data.in_(['confirm_no']))
 async def confirm_no(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Запись отменена. Можете начать заново.")
+    await callback.message.edit_text("❌ Запись отменена. Можете начать заново.")
     await state.clear()
     await callback.answer()
 
@@ -687,10 +785,8 @@ async def set_notifications(callback: CallbackQuery):
     user_id = callback.from_user.id
     enabled = (callback.data == "notif_yes")
     await set_user_notifications(user_id, enabled)
-    if enabled:
-        await callback.message.edit_text("✅ Вы будете получать напоминания о записях.")
-    else:
-        await callback.message.edit_text("❌ Напоминания отключены.")
+    text = "✅ Вы будете получать напоминания о записях." if enabled else "❌ Напоминания отключены."
+    await callback.message.edit_text(text)
     await callback.answer()
 
 # ---------- Просмотр и отмена записей ----------
@@ -701,7 +797,10 @@ async def my_appointments(message: Message):
     if not apps:
         await message.answer("У вас пока нет записей.")
         return
-    await message.answer("Ваши записи:", reply_markup=appointments_inline_keyboard(apps))
+    await message.answer(
+        "Ваши записи:\nНажмите ❌ рядом с записью, чтобы отменить её.",
+        reply_markup=build_appointments_keyboard(apps)
+    )
 
 @dp.callback_query(F.data.startswith("cancel_"))
 async def start_cancel_appointment(callback: CallbackQuery, state: FSMContext):
@@ -751,7 +850,16 @@ async def confirm_cancel(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(StateFilter(CancelFSM.waiting_confirm), F.data.in_(['abort_cancel']))
 async def abort_cancel(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Отмена отмены (действие не выполнено).")
+    # Возвращаем пользователя к списку записей
+    user_id = callback.from_user.id
+    apps = await get_user_appointments(user_id)
+    if apps:
+        await callback.message.edit_text(
+            "Ваши записи:",
+            reply_markup=build_appointments_keyboard(apps)
+        )
+    else:
+        await callback.message.edit_text("У вас нет записей.")
     await state.clear()
     await callback.answer()
 
